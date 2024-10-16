@@ -36,7 +36,7 @@ def resize(input,
                         f'input size {(input_h, input_w)} is `x+1` and '
                         f'out size {(output_h, output_w)} is `nx+1`')
                     
-    return F.interpolate(input, size, scale_factor, mode, align_corners
+    return F.interpolate(input, size, scale_factor, mode, align_corners)
 
 def position_embedding(embed_dim: int, pos: Tensor) -> Tensor:
     """Compute the 1D sine/cosine position embedding.
