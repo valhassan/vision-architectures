@@ -1,0 +1,9 @@
+download_url: https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_base_e100.pth
+
+wavelengths:
+  maxar:
+    R: 0.665
+    G: 0.549
+    B: 0.481
+    NIR: 0.839
+     
