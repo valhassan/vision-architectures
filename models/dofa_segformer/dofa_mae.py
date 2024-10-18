@@ -8,10 +8,12 @@ from typing import Any, Dict
 
 import kornia.augmentation as K
 import torch
+import yaml
 import warnings
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
+from pathlib import Path
 from timm.models.vision_transformer import Block
 from torch import Tensor
 from torchvision.models._api import Weights, WeightsEnum
@@ -248,38 +250,210 @@ class Encoder(nn.Module):
     Reference implementation:
 
     * https://github.com/microsoft/torchgeo/blob/main/torchgeo/models/dofa.py
+    * https://github.com/zhu-xlab/DOFA/blob/master/downstream_tasks/segmentation/models/dofa_vit.py
     
     """
     def __init__(self, 
-                 img_size: int = 224,
+                 img_size: tuple = (224, 224),
                  patch_size: int = 16,
                  embed_dim: int = 768,
                  num_heads: int = 12,
                  depth: int = 12,
                  mlp_ratio: int = 4,
-                 drop_rate=0.0,
-                 wavelengths: Dict[str, Dict[str, float]] = None,
+                 qkv_bias: bool = True,
+                 drop_rate: float = 0.0,
+                 attn_drop_rate: float = 0.0,
+                 drop_path_rate: float = 0.0,
+                 pre_norm: bool = False,
+                 final_norm: bool = False,
+                 interpolate_mode: str ='bicubic',
+                 norm_layer: type[nn.Module] = partial(nn.LayerNorm, eps=1e-6),
+                 out_layers: int | list[int] = -1,
                  ):
         
-        
-        
+        script_dir = Path(__file__).resolve().parent
+        config_path = script_dir / 'dofa.yaml'
+        with open(config_path, 'r') as f:
+            cfg = yaml.safe_load(f)
+        sensor_name = cfg["sensor"]
+        bands = cfg["bands"]
+        wavelengths = cfg["wavelengths"][sensor_name]
+        model_wavelengths = [wavelengths[band] for band in bands]
         
         self.img_size = img_size
         self.patch_size = patch_size
         self.embed_dim = embed_dim
         self.num_heads = num_heads
+        self.qkv_bias = qkv_bias
         self.depth = depth
         self.mlp_ratio = mlp_ratio
         self.drop_rate = drop_rate
-        self.wavelengths = wavelengths
+        self.drop_path_rate = drop_path_rate
+        self.attn_drop_rate = attn_drop_rate
+        self.wavelengths = model_wavelengths
+        self.pre_norm = pre_norm
+        self.final_norm = final_norm
+        self.interpolate_mode = interpolate_mode
 
         super().__init__()
         
         self.patch_embed = DOFAEmbedding(dynamic_embed_dim=128, kernel_size=16, embed_dim=self.embed_dim)
-        self.num_patches = (self.img_size // patch_size) ** 2
+        self.num_patches = (self.img_size[0] // patch_size) ** 2
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, self.embed_dim))
         self.drop_after_pos = nn.Dropout(p=self.drop_rate)
+        self.norm = norm_layer(self.embed_dim)
+        
+        self.blocks = nn.ModuleList([Block(self.embed_dim, 
+                                           self.num_heads, 
+                                           self.mlp_ratio, 
+                                           self.qkv_bias, 
+                                           norm_layer=norm_layer) for i in range(self.depth)])
+        
+    def _pos_embeding(self, patched_img, hw_shape, pos_embed):
+        """Positioning embeding method.
+
+        Resize the pos_embed, if the input image size doesn't match
+            the training size.
+        Args:
+            patched_img (torch.Tensor): The patched image, it should be
+                shape of [B, L1, C].
+            hw_shape (tuple): The downsampled image resolution.
+            pos_embed (torch.Tensor): The pos_embed weighs, it should be
+                shape of [B, L2, c].
+        Return:
+            torch.Tensor: The pos encoded image feature.
+        """
+        assert patched_img.ndim == 3 and pos_embed.ndim == 3, \
+            'the shapes of patched_img and pos_embed must be [B, L, C]'
+        x_len, pos_len = patched_img.shape[1], pos_embed.shape[1]
+        if x_len != pos_len:
+            if pos_len == (self.img_size[0] // self.patch_size) * (
+                    self.img_size[1] // self.patch_size) + 1:
+                pos_h = self.img_size[0] // self.patch_size
+                pos_w = self.img_size[1] // self.patch_size
+            else:
+                raise ValueError(
+                    'Unexpected shape of pos_embed, got {}.'.format(
+                        pos_embed.shape))
+            pos_embed = self.resize_pos_embed(pos_embed, hw_shape,
+                                            (pos_h, pos_w),
+                                            self.interpolate_mode)
+        return self.drop_after_pos(patched_img + pos_embed)
+        
+    @staticmethod
+    def resize_pos_embed(pos_embed, input_shpae, pos_shape, mode):
+        """Resize pos_embed weights.
+
+        Resize pos_embed using bicubic interpolate method.
+        Args:
+            pos_embed (torch.Tensor): Position embedding weights.
+            input_shpae (tuple): Tuple for (downsampled input image height,
+                downsampled input image width).
+            pos_shape (tuple): The resolution of downsampled origin training
+                image.
+            mode (str): Algorithm used for upsampling:
+                ``'nearest'`` | ``'linear'`` | ``'bilinear'`` | ``'bicubic'`` |
+                ``'trilinear'``. Default: ``'nearest'``
+        Return:
+            torch.Tensor: The resized pos_embed of shape [B, L_new, C]
+        """
+        assert pos_embed.ndim == 3, 'shape of pos_embed must be [B, L, C]'
+        pos_h, pos_w = pos_shape
+        cls_token_weight = pos_embed[:, 0]
+        pos_embed_weight = pos_embed[:, (-1 * pos_h * pos_w):]
+        pos_embed_weight = pos_embed_weight.reshape(
+            1, pos_h, pos_w, pos_embed.shape[2]).permute(0, 3, 1, 2)
+        pos_embed_weight = resize(
+            pos_embed_weight, size=input_shpae, align_corners=False, mode=mode)
+        cls_token_weight = cls_token_weight.unsqueeze(1)
+        pos_embed_weight = torch.flatten(pos_embed_weight, 2).transpose(1, 2)
+        pos_embed = torch.cat((cls_token_weight, pos_embed_weight), dim=1)
+        return pos_embed
+        
+    def forward(self, x: Tensor):
+        B = x.shape[0]
+        if self.wavelengths is None:
+            raise ValueError("Wavelengths must be provided")
+        wavelist = torch.tensor(self.wavelengths, device=x.device).float()
+        self.waves = wavelist
+        
+        x, _ = self.patch_embed(x, self.waves)
+        hw = self.img_size[0] // self.patch_embed.kernel_size
+        hw_shape = (hw, hw)
+        cls_tokens = self.cls_token.expand(B, -1, -1)
+        x = torch.cat((cls_tokens, x), dim=1)
+        x = self._pos_embeding(x, hw_shape, self.pos_embed)
+        
+        
+        if self.pre_norm:
+            x = self.norm(x)
+        outs = []
+        
+        for i, blk in enumerate(self.blocks):
+            x = blk(x)
+            if i == len(self.blocks) - 1:
+                if self.final_norm:
+                    x = self.norm(x)
+            if i in self.out_layers:
+                out = x[:, 1:]
+                B, _, C = out.shape
+                out = out.reshape(B, hw_shape[0], hw_shape[1], C).permute(0, 3, 1, 2).contiguous()
+                outs.append(out)
+        
+        return outs
+    
+def dofa_encoder_base(pretrained: bool = True, *args: Any, **kwargs: Any):
+    url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_base_e120.pth"
+    kwargs |= {'patch_size': 16, 'embed_dim': 768, 'depth': 12, 'num_heads': 12}
+    model = Encoder(*args, **kwargs)
+    
+    if pretrained:
+        model_dict = torch.hub.load_state_dict_from_url(url, progress=True)
+        del model_dict["mask_token"]
+        del model_dict["projector.weight"], model_dict["projector.bias"]
+        
+        missing_keys, unexpected_keys = model.load_state_dict(model_dict, strict=False)
+        assert not missing_keys
+        assert not unexpected_keys
+    
+    return model
+
+def dofa_encoder_large(pretrained: bool = True, *args: Any, **kwargs: Any):
+    url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_large_e100.pth"
+    kwargs |= {'patch_size': 16, 'embed_dim': 1024, 'depth': 24, 'num_heads': 16}
+    model = Encoder(*args, **kwargs)
+    
+    if pretrained:
+        model_dict = torch.hub.load_state_dict_from_url(url, progress=True, map_location='cpu')
+        del model_dict["mask_token"]
+        del model_dict["projector.weight"], model_dict["projector.bias"]
+        
+        missing_keys, unexpected_keys = model.load_state_dict(model_dict, strict=False)
+        assert not missing_keys
+        assert not unexpected_keys
+    
+    return model
+
+if __name__ == '__main__':
+    model = dofa_encoder_large()
+    batch_size = 6
+    img = torch.rand(batch_size, 4, 512, 512)
+    out = model(img)
+    print(out)           
+            
+        
+        
+        
+
+        
+        
+        
+        
+        
+        
+        
+        
         
         
 class DOFA(nn.Module):
