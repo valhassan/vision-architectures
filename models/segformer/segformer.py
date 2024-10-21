@@ -112,14 +112,14 @@ class SegFormer(nn.Module):
     
 
 if __name__ == '__main__':
-    checkpoint_path = "/export/sata01/wspace/test_dir/multi/all_rgb_data/RGB_4class_all_data_b5_VA_20230915.pth.tar"
-    out_path = "/export/sata01/wspace/test_dir/multi/all_rgb_data/encoder_only_weights.pth.tar"
-    mit_b5_encoder_out_path = "/export/sata01/wspace/test_dir/multi/all_rgb_data/mit_b5_encoder.pth.tar"
-    checkpoint = load_checkpoint(checkpoint_path)
-    encoder_state_dict = {k: v for k, v in checkpoint['model_state_dict'].items() if 'encoder' in k}
-    torch.save(encoder_state_dict, mit_b5_encoder_out_path)
-    encoder_state_dict = torch.load(mit_b5_encoder_out_path)
-    print(encoder_state_dict.keys())
+    # checkpoint_path = "/export/sata01/wspace/test_dir/multi/all_rgb_data/RGB_4class_all_data_b5_VA_20230915.pth.tar"
+    # out_path = "/export/sata01/wspace/test_dir/multi/all_rgb_data/encoder_only_weights.pth.tar"
+    # mit_b5_encoder_out_path = "/export/sata01/wspace/test_dir/multi/all_rgb_data/mit_b5_encoder.pth.tar"
+    # checkpoint = load_checkpoint(checkpoint_path)
+    # encoder_state_dict = {k: v for k, v in checkpoint['model_state_dict'].items() if 'encoder' in k}
+    # torch.save(encoder_state_dict, mit_b5_encoder_out_path)
+    # encoder_state_dict = torch.load(mit_b5_encoder_out_path)
+    # print(encoder_state_dict.keys())
     # model = SegFormer("mit_b5", in_channels=3, classes=5)
     # model.load_state_dict(encoder_state_dict, strict=False)
     # model_state_dict = model.state_dict()
@@ -133,3 +133,7 @@ if __name__ == '__main__':
     # checkpoint = torch.load(out_path)
     # print(checkpoint.keys())
     
+    model = SegFormer("mit_b5", in_channels=3, classes=5)
+    batch_size = 8
+    x = torch.rand(batch_size, 3, 512, 512)
+    out = model(x)
