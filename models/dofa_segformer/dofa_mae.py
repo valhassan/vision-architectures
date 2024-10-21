@@ -293,7 +293,17 @@ class Encoder(nn.Module):
         self.wavelengths = model_wavelengths
         self.pre_norm = pre_norm
         self.final_norm = final_norm
+        self.out_layers = out_layers
         self.interpolate_mode = interpolate_mode
+        
+        if isinstance(out_layers, int):
+            if out_layers == -1:
+                out_layers= depth - 1
+            self.out_layers = [out_layers]
+        elif isinstance(out_layers, list) or isinstance(out_layers, tuple):
+            self.out_layers = out_layers
+        else:
+            raise TypeError('out_indices must be type of int, list or tuple')
 
         super().__init__()
         
@@ -405,7 +415,7 @@ class Encoder(nn.Module):
     
 def dofa_encoder_base(pretrained: bool = True, *args: Any, **kwargs: Any):
     url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_base_e120.pth"
-    kwargs |= {'patch_size': 16, 'embed_dim': 768, 'depth': 12, 'num_heads': 12}
+    kwargs |= {'patch_size': 16, 'embed_dim': 768, 'depth': 12, 'num_heads': 12, 'out_layers': [2, 5, 8, 11]}
     model = Encoder(*args, **kwargs)
     
     if pretrained:
@@ -421,7 +431,7 @@ def dofa_encoder_base(pretrained: bool = True, *args: Any, **kwargs: Any):
 
 def dofa_encoder_large(pretrained: bool = True, *args: Any, **kwargs: Any):
     url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_large_e100.pth"
-    kwargs |= {'patch_size': 16, 'embed_dim': 1024, 'depth': 24, 'num_heads': 16}
+    kwargs |= {'patch_size': 16, 'embed_dim': 1024, 'depth': 24, 'num_heads': 16, 'out_layers': [3, 7, 11, 23]}
     model = Encoder(*args, **kwargs)
     
     if pretrained:
@@ -436,11 +446,13 @@ def dofa_encoder_large(pretrained: bool = True, *args: Any, **kwargs: Any):
     return model
 
 if __name__ == '__main__':
-    model = dofa_encoder_large()
+    model = dofa_encoder_base()
     batch_size = 6
-    img = torch.rand(batch_size, 4, 512, 512)
+    img = torch.rand(batch_size, 4, 224, 224)
     out = model(img)
-    print(out)           
+    print(f"Output length: {len(out)}")
+    for i in out:
+        print(f"Output feature shape: {i.shape}")        
             
         
         
