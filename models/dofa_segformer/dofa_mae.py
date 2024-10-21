@@ -8,37 +8,13 @@ from typing import Any, Dict
 
 import kornia.augmentation as K
 import torch
-import yaml
 import warnings
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
-from pathlib import Path
 from timm.models.vision_transformer import Block
 from torch import Tensor
 from torchvision.models._api import Weights, WeightsEnum
-
-def resize(input,
-           size=None,
-           scale_factor=None,
-           mode='nearest',
-           align_corners=None,
-           warning=True):
-    if warning:
-        if size is not None and align_corners:
-            input_h, input_w = tuple(int(x) for x in input.shape[2:])
-            output_h, output_w = tuple(int(x) for x in size)
-            if output_h > input_h or output_w > output_h:
-                if ((output_h > 1 and output_w > 1 and input_h > 1
-                     and input_w > 1) and (output_h - 1) % (input_h - 1)
-                        and (output_w - 1) % (input_w - 1)):
-                    warnings.warn(
-                        f'When align_corners={align_corners}, '
-                        'the output would more aligned if '
-                        f'input size {(input_h, input_w)} is `x+1` and '
-                        f'out size {(output_h, output_w)} is `nx+1`')
-                    
-    return F.interpolate(input, size, scale_factor, mode, align_corners)
 
 def position_embedding(embed_dim: int, pos: Tensor) -> Tensor:
     """Compute the 1D sine/cosine position embedding.
@@ -243,213 +219,315 @@ class DOFAEmbedding(nn.Module):
 
         return x, waves
 
-class Encoder(nn.Module):
-    """
-    Dynamic One-For-All (DOFA) model for segmentation.
+class DOFA(nn.Module):
+    """Dynamic One-For-All (DOFA) model.
 
     Reference implementation:
 
-    * https://github.com/microsoft/torchgeo/blob/main/torchgeo/models/dofa.py
-    * https://github.com/zhu-xlab/DOFA/blob/master/downstream_tasks/segmentation/models/dofa_vit.py
-    
+    * https://github.com/zhu-xlab/DOFA
+
+    If you use this model in your research, please cite the following paper:
+
+    * https://arxiv.org/abs/2403.15356
+
+    .. versionadded:: 0.6
     """
-    def __init__(self, 
-                 img_size: tuple = (224, 224),
-                 patch_size: int = 16,
-                 embed_dim: int = 768,
-                 num_heads: int = 12,
-                 depth: int = 12,
-                 mlp_ratio: int = 4,
-                 qkv_bias: bool = True,
-                 drop_rate: float = 0.0,
-                 attn_drop_rate: float = 0.0,
-                 drop_path_rate: float = 0.0,
-                 pre_norm: bool = False,
-                 final_norm: bool = False,
-                 interpolate_mode: str ='bicubic',
-                 norm_layer: type[nn.Module] = partial(nn.LayerNorm, eps=1e-6),
-                 out_layers: int | list[int] = -1,
-                 ):
-        
-        script_dir = Path(__file__).resolve().parent
-        config_path = script_dir / 'dofa.yaml'
-        with open(config_path, 'r') as f:
-            cfg = yaml.safe_load(f)
-        sensor_name = cfg["sensor"]
-        bands = cfg["bands"]
-        wavelengths = cfg["wavelengths"][sensor_name]
-        model_wavelengths = [wavelengths[band] for band in bands]
-        
-        self.img_size = img_size
-        self.patch_size = patch_size
-        self.embed_dim = embed_dim
-        self.num_heads = num_heads
-        self.qkv_bias = qkv_bias
-        self.depth = depth
-        self.mlp_ratio = mlp_ratio
-        self.drop_rate = drop_rate
-        self.drop_path_rate = drop_path_rate
-        self.attn_drop_rate = attn_drop_rate
-        self.wavelengths = model_wavelengths
-        self.pre_norm = pre_norm
-        self.final_norm = final_norm
-        self.out_layers = out_layers
-        self.interpolate_mode = interpolate_mode
-        
-        if isinstance(out_layers, int):
-            if out_layers == -1:
-                out_layers= depth - 1
-            self.out_layers = [out_layers]
-        elif isinstance(out_layers, list) or isinstance(out_layers, tuple):
-            self.out_layers = out_layers
-        else:
-            raise TypeError('out_indices must be type of int, list or tuple')
 
+    def __init__(
+        self,
+        img_size: int = 224,
+        patch_size: int = 16,
+        drop_rate: float = 0.0,
+        embed_dim: int = 1024,
+        depth: int = 24,
+        num_heads: int = 16,
+        dynamic_embed_dim: int = 128,
+        num_classes: int = 45,
+        global_pool: bool = True,
+        mlp_ratio: float = 4.0,
+        norm_layer: type[nn.Module] = partial(nn.LayerNorm, eps=1e-6),  # type: ignore[assignment]
+    ) -> None:
+        """Initialize a new DOFA instance.
+
+        Args:
+            img_size: Input image size.
+            patch_size: Patch size.
+            drop_rate: Head dropout rate.
+            embed_dim: Transformer embedding dimension.
+            depth: Depth of transformer.
+            num_heads: Number of attention heads.
+            dynamic_embed_dim: Dimensions of dynamic weight generator.
+            num_classes: Number of classes for classification head.
+            global_pool: Whether or not to perform global pooling.
+            mlp_ratio: Ratio of MLP hidden dim to embedding dim.
+            norm_layer: Normalization layer.
+        """
         super().__init__()
-        
-        self.patch_embed = DOFAEmbedding(dynamic_embed_dim=128, kernel_size=16, embed_dim=self.embed_dim)
-        self.num_patches = (self.img_size[0] // patch_size) ** 2
+
+        self.dynamic_embed_dim = dynamic_embed_dim
+        self.global_pool = global_pool
+        if self.global_pool:
+            norm_layer = norm_layer
+            embed_dim = embed_dim
+            self.fc_norm = norm_layer(embed_dim)
+        else:
+            self.norm = norm_layer(embed_dim)
+
+        # --------------------------------------------------------------------------
+        # MAE encoder specifics
+        self.patch_embed = DOFAEmbedding(
+            dynamic_embed_dim=128, kernel_size=16, embed_dim=embed_dim
+        )
+        self.num_patches = (img_size // patch_size) ** 2
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
-        self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, self.embed_dim))
-        self.drop_after_pos = nn.Dropout(p=self.drop_rate)
-        self.norm = norm_layer(self.embed_dim)
-        
-        self.blocks = nn.ModuleList([Block(self.embed_dim, 
-                                           self.num_heads, 
-                                           self.mlp_ratio, 
-                                           self.qkv_bias, 
-                                           norm_layer=norm_layer) for i in range(self.depth)])
-        
-    def _pos_embeding(self, patched_img, hw_shape, pos_embed):
-        """Positioning embeding method.
+        # ---------------------------------------------------------------------------
+        self.pos_embed = nn.Parameter(
+            torch.zeros(1, self.num_patches + 1, embed_dim), requires_grad=False
+        )  # fixed sin-cos embedding
 
-        Resize the pos_embed, if the input image size doesn't match
-            the training size.
-        Args:
-            patched_img (torch.Tensor): The patched image, it should be
-                shape of [B, L1, C].
-            hw_shape (tuple): The downsampled image resolution.
-            pos_embed (torch.Tensor): The pos_embed weighs, it should be
-                shape of [B, L2, c].
-        Return:
-            torch.Tensor: The pos encoded image feature.
-        """
-        assert patched_img.ndim == 3 and pos_embed.ndim == 3, \
-            'the shapes of patched_img and pos_embed must be [B, L, C]'
-        x_len, pos_len = patched_img.shape[1], pos_embed.shape[1]
-        if x_len != pos_len:
-            if pos_len == (self.img_size[0] // self.patch_size) * (
-                    self.img_size[1] // self.patch_size) + 1:
-                pos_h = self.img_size[0] // self.patch_size
-                pos_w = self.img_size[1] // self.patch_size
-            else:
-                raise ValueError(
-                    'Unexpected shape of pos_embed, got {}.'.format(
-                        pos_embed.shape))
-            pos_embed = self.resize_pos_embed(pos_embed, hw_shape,
-                                            (pos_h, pos_w),
-                                            self.interpolate_mode)
-        return self.drop_after_pos(patched_img + pos_embed)
-        
-    @staticmethod
-    def resize_pos_embed(pos_embed, input_shpae, pos_shape, mode):
-        """Resize pos_embed weights.
+        self.blocks = nn.ModuleList(
+            [
+                Block(
+                    embed_dim,
+                    num_heads,
+                    mlp_ratio,
+                    qkv_bias=True,
+                    norm_layer=norm_layer,
+                )
+                for i in range(depth)
+            ]
+        )
 
-        Resize pos_embed using bicubic interpolate method.
+        self.head_drop = nn.Dropout(drop_rate)
+        self.head = (
+            nn.Linear(embed_dim, num_classes) if num_classes > 0 else nn.Identity()
+        )
+
+    def forward_features(self, x: Tensor, wavelengths: list[float]) -> Tensor:
+        """Forward pass of the feature embedding layer.
+
         Args:
-            pos_embed (torch.Tensor): Position embedding weights.
-            input_shpae (tuple): Tuple for (downsampled input image height,
-                downsampled input image width).
-            pos_shape (tuple): The resolution of downsampled origin training
-                image.
-            mode (str): Algorithm used for upsampling:
-                ``'nearest'`` | ``'linear'`` | ``'bilinear'`` | ``'bicubic'`` |
-                ``'trilinear'``. Default: ``'nearest'``
-        Return:
-            torch.Tensor: The resized pos_embed of shape [B, L_new, C]
+            x: Input mini-batch.
+            wavelengths: Wavelengths of each spectral band (μm).
+
+        Returns:
+            Output mini-batch.
         """
-        assert pos_embed.ndim == 3, 'shape of pos_embed must be [B, L, C]'
-        pos_h, pos_w = pos_shape
-        cls_token_weight = pos_embed[:, 0]
-        pos_embed_weight = pos_embed[:, (-1 * pos_h * pos_w):]
-        pos_embed_weight = pos_embed_weight.reshape(
-            1, pos_h, pos_w, pos_embed.shape[2]).permute(0, 3, 1, 2)
-        pos_embed_weight = resize(
-            pos_embed_weight, size=input_shpae, align_corners=False, mode=mode)
-        cls_token_weight = cls_token_weight.unsqueeze(1)
-        pos_embed_weight = torch.flatten(pos_embed_weight, 2).transpose(1, 2)
-        pos_embed = torch.cat((cls_token_weight, pos_embed_weight), dim=1)
-        return pos_embed
-        
-    def forward(self, x: Tensor):
-        B = x.shape[0]
-        if self.wavelengths is None:
-            raise ValueError("Wavelengths must be provided")
-        wavelist = torch.tensor(self.wavelengths, device=x.device).float()
+        # embed patches
+        wavelist = torch.tensor(wavelengths, device=x.device).float()
         self.waves = wavelist
-        
+
         x, _ = self.patch_embed(x, self.waves)
-        hw = self.img_size[0] // self.patch_embed.kernel_size
-        hw_shape = (hw, hw)
-        cls_tokens = self.cls_token.expand(B, -1, -1)
+
+        x = x + self.pos_embed[:, 1:, :]
+        # append cls token
+        cls_token = self.cls_token + self.pos_embed[:, :1, :]
+        cls_tokens = cls_token.expand(x.shape[0], -1, -1)
         x = torch.cat((cls_tokens, x), dim=1)
-        x = self._pos_embeding(x, hw_shape, self.pos_embed)
-        
-        
-        if self.pre_norm:
+
+        # apply Transformer blocks
+        for block in self.blocks:
+            x = block(x)
+
+        if self.global_pool:
+            x = x[:, 1:, :].mean(dim=1)  # global pool without cls token
+            outcome: Tensor = self.fc_norm(x)
+        else:
             x = self.norm(x)
-        outs = []
-        
-        for i, blk in enumerate(self.blocks):
-            x = blk(x)
-            if i == len(self.blocks) - 1:
-                if self.final_norm:
-                    x = self.norm(x)
-            if i in self.out_layers:
-                out = x[:, 1:]
-                B, _, C = out.shape
-                out = out.reshape(B, hw_shape[0], hw_shape[1], C).permute(0, 3, 1, 2).contiguous()
-                outs.append(out)
-        
-        return outs
-    
-def dofa_encoder_base(pretrained: bool = True, *args: Any, **kwargs: Any):
-    url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_base_e120.pth"
-    kwargs |= {'patch_size': 16, 'embed_dim': 768, 'depth': 12, 'num_heads': 12, 'out_layers': [2, 5, 8, 11]}
-    model = Encoder(*args, **kwargs)
-    
-    if pretrained:
-        model_dict = torch.hub.load_state_dict_from_url(url, progress=True)
-        del model_dict["mask_token"]
-        del model_dict["projector.weight"], model_dict["projector.bias"]
-        
-        missing_keys, unexpected_keys = model.load_state_dict(model_dict, strict=False)
-        assert not missing_keys
-        assert not unexpected_keys
-    
+            outcome = x[:, 0]
+        return outcome
+
+    def forward_head(self, x: Tensor, pre_logits: bool = False) -> Tensor:
+        """Forward pass of the attention head.
+
+        Args:
+            x: Input mini-batch.
+            pre_logits: Whether or not to return the layer before logits are computed.
+
+        Returns:
+            Output mini-batch.
+        """
+        x = self.head_drop(x)
+        x = x if pre_logits else self.head(x)
+        return x
+
+    def forward(self, x: Tensor, wavelengths: list[float]) -> Tensor:
+        """Forward pass of the model.
+
+        Args:
+            x: Input mini-batch.
+            wavelengths: Wavelengths of each spectral band (μm).
+
+        Returns:
+            Output mini-batch.
+        """
+        x = self.forward_features(x, wavelengths)
+        x = self.forward_head(x)
+        return x
+
+
+# https://github.com/zhu-xlab/DOFA/blob/master/normalize_dataset.py
+# Normalization is sensor-dependent and is therefore left out
+_dofa_transforms = K.AugmentationSequential(K.CenterCrop((224, 224)))
+
+# https://github.com/pytorch/vision/pull/6883
+# https://github.com/pytorch/vision/pull/7107
+# Can be removed once torchvision>=0.15 is required
+Weights.__deepcopy__ = lambda *args, **kwargs: args[0]
+
+
+class DOFABase16_Weights(WeightsEnum):  # type: ignore[misc]
+    """Dynamic One-For-All (DOFA) base patch size 16 weights.
+
+    .. versionadded:: 0.6
+    """
+
+    DOFA_MAE = Weights(
+        url='https://hf.co/torchgeo/dofa/resolve/ade8745c5ec6eddfe15d8c03421e8cb8f21e66ff/dofa_base_patch16_224-7cc0f413.pth',  # noqa: E501
+        transforms=_dofa_transforms,
+        meta={
+            'dataset': 'SatlasPretrain, Five-Billion-Pixels, HySpecNet-11k',
+            'model': 'dofa_base_patch16_224',
+            'publication': 'https://arxiv.org/abs/2403.15356',
+            'repo': 'https://github.com/zhu-xlab/DOFA',
+            'ssl_method': 'mae',
+        },
+    )
+
+
+class DOFALarge16_Weights(WeightsEnum):  # type: ignore[misc]
+    """Dynamic One-For-All (DOFA) large patch size 16 weights.
+
+    .. versionadded:: 0.6
+    """
+
+    DOFA_MAE = Weights(
+        url='https://hf.co/torchgeo/dofa/resolve/ade8745c5ec6eddfe15d8c03421e8cb8f21e66ff/dofa_large_patch16_224-fbd47fa9.pth',  # noqa: E501
+        transforms=_dofa_transforms,
+        meta={
+            'dataset': 'SatlasPretrain, Five-Billion-Pixels, HySpecNet-11k',
+            'model': 'dofa_large_patch16_224',
+            'publication': 'https://arxiv.org/abs/2403.15356',
+            'repo': 'https://github.com/zhu-xlab/DOFA',
+            'ssl_method': 'mae',
+        },
+    )
+
+
+def dofa_small_patch16_224(*args: Any, **kwargs: Any) -> DOFA:
+    """Dynamic One-For-All (DOFA) small patch size 16 model.
+
+    If you use this model in your research, please cite the following paper:
+
+    * https://arxiv.org/abs/2403.15356
+
+    .. versionadded:: 0.6
+
+    Args:
+        *args: Additional arguments to pass to :class:`DOFA`.
+        **kwargs: Additional keywork arguments to pass to :class:`DOFA`.
+
+    Returns:
+        A DOFA small 16 model.
+    """
+    kwargs |= {'patch_size': 16, 'embed_dim': 384, 'depth': 12, 'num_heads': 6}
+    model = DOFA(*args, **kwargs)
     return model
 
-def dofa_encoder_large(pretrained: bool = True, *args: Any, **kwargs: Any):
-    url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_large_e100.pth"
-    kwargs |= {'patch_size': 16, 'embed_dim': 1024, 'depth': 24, 'num_heads': 16, 'out_layers': [3, 7, 11, 23]}
-    model = Encoder(*args, **kwargs)
-    
-    if pretrained:
-        model_dict = torch.hub.load_state_dict_from_url(url, progress=True, map_location='cpu')
-        del model_dict["mask_token"]
-        del model_dict["projector.weight"], model_dict["projector.bias"]
-        
-        missing_keys, unexpected_keys = model.load_state_dict(model_dict, strict=False)
-        assert not missing_keys
+
+def dofa_base_patch16_224(
+    weights: DOFABase16_Weights | None = None, *args: Any, **kwargs: Any
+) -> DOFA:
+    """Dynamic One-For-All (DOFA) base patch size 16 model.
+
+    If you use this model in your research, please cite the following paper:
+
+    * https://arxiv.org/abs/2403.15356
+
+    .. versionadded:: 0.6
+
+    Args:
+        weights: Pre-trained model weights to use.
+        *args: Additional arguments to pass to :class:`DOFA`.
+        **kwargs: Additional keywork arguments to pass to :class:`DOFA`.
+
+    Returns:
+        A DOFA base 16 model.
+    """
+    kwargs |= {'patch_size': 16, 'embed_dim': 768, 'depth': 12, 'num_heads': 12}
+    model = DOFA(*args, **kwargs)
+
+    if weights:
+        missing_keys, unexpected_keys = model.load_state_dict(
+            weights.get_state_dict(progress=True), strict=False
+        )
+        # Both fc_norm and head are generated dynamically
+        assert set(missing_keys) <= {
+            'fc_norm.weight',
+            'fc_norm.bias',
+            'head.weight',
+            'head.bias',
+        }
         assert not unexpected_keys
-    
+
     return model
 
-if __name__ == '__main__':
-    model = dofa_encoder_base()
-    batch_size = 6
-    img = torch.rand(batch_size, 4, 224, 224)
-    out = model(img)
-    print(f"Output length: {len(out)}")
-    for i in out:
-        print(f"Output feature shape: {i.shape}")        
+
+def dofa_large_patch16_224(
+    weights: DOFALarge16_Weights | None = None, *args: Any, **kwargs: Any
+) -> DOFA:
+    """Dynamic One-For-All (DOFA) large patch size 16 model.
+
+    If you use this model in your research, please cite the following paper:
+
+    * https://arxiv.org/abs/2403.15356
+
+    .. versionadded:: 0.6
+
+    Args:
+        weights: Pre-trained model weights to use.
+        *args: Additional arguments to pass to :class:`DOFA`.
+        **kwargs: Additional keywork arguments to pass to :class:`DOFA`.
+
+    Returns:
+        A DOFA large 16 model.
+    """
+    kwargs |= {'patch_size': 16, 'embed_dim': 1024, 'depth': 24, 'num_heads': 16}
+    model = DOFA(*args, **kwargs)
+
+    if weights:
+        missing_keys, unexpected_keys = model.load_state_dict(
+            weights.get_state_dict(progress=True), strict=False
+        )
+        # Both fc_norm and head are generated dynamically
+        assert set(missing_keys) <= {
+            'fc_norm.weight',
+            'fc_norm.bias',
+            'head.weight',
+            'head.bias',
+        }
+        assert not unexpected_keys
+
+    return model
+
+
+def dofa_huge_patch16_224(*args: Any, **kwargs: Any) -> DOFA:
+    """Dynamic One-For-All (DOFA) huge patch size 16 model.
+
+    If you use this model in your research, please cite the following paper:
+
+    * https://arxiv.org/abs/2403.15356
+
+    .. versionadded:: 0.6
+
+    Args:
+        *args: Additional arguments to pass to :class:`DOFA`.
+        **kwargs: Additional keywork arguments to pass to :class:`DOFA`.
+
+    Returns:
+        A DOFA huge 16 model.
+    """
+    kwargs |= {'patch_size': 14, 'embed_dim': 1280, 'depth': 32, 'num_heads': 16}
+    model = DOFA(*args, **kwargs)
+    
+    return model
