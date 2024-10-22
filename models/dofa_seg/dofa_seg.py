@@ -313,7 +313,6 @@ class Encoder(nn.Module):
         self.cls_token = nn.Parameter(torch.zeros(1, 1, embed_dim))
         self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches + 1, self.embed_dim))
         self.drop_after_pos = nn.Dropout(p=self.drop_rate)
-        self.norm = norm_layer(self.embed_dim)
         
         self.blocks = nn.ModuleList([Block(self.embed_dim, 
                                            self.num_heads, 
@@ -324,7 +323,7 @@ class Encoder(nn.Module):
     
     def init_weights(self):
         if self.pretrained:
-            print(f"Loading pretrained weights for {self.encoder_name}")
+            # print(f"Loading pretrained weights for {self.encoder_name}")
             if self.encoder_name == 'dofa_base':
                 model_dict = dofa_encoder_base()
             elif self.encoder_name == 'dofa_large':
@@ -332,7 +331,7 @@ class Encoder(nn.Module):
             
             if 'pos_embed' in model_dict.keys():
                 if self.pos_embed.shape != model_dict['pos_embed'].shape:
-                    print(f"Resize the pos_embed shape from {model_dict['pos_embed'].shape} to {self.pos_embed.shape}")
+                    # print(f"Resize the pos_embed shape from {model_dict['pos_embed'].shape} to {self.pos_embed.shape}")
                     h, w = self.img_size
                     pos_size = int(math.sqrt(model_dict['pos_embed'].shape[1] - 1))
                     model_dict['pos_embed'] = self.resize_pos_embed(model_dict['pos_embed'], 
@@ -417,16 +416,18 @@ class Encoder(nn.Module):
         x = torch.cat((cls_tokens, x), dim=1)
         x = self._pos_embeding(x, hw_shape, self.pos_embed)
         
-        
+        partial_norm = partial(nn.LayerNorm, eps=1e-6)
+        pre_norm = partial_norm(self.embed_dim)
+        final_norm = partial_norm(self.embed_dim)
         if self.pre_norm:
-            x = self.norm(x)
+            x = pre_norm(x)
         outs = []
         
         for i, blk in enumerate(self.blocks):
             x = blk(x)
             if i == len(self.blocks) - 1:
                 if self.final_norm:
-                    x = self.norm(x)
+                    x = final_norm(x)
             if i in self.out_layers:
                 out = x[:, 1:]
                 B, _, C = out.shape
@@ -439,6 +440,7 @@ def dofa_encoder_base(pretrained: bool = True, *args: Any, **kwargs: Any):
     url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_base_e120.pth"
     model_dict = torch.hub.load_state_dict_from_url(url, progress=True, map_location='cpu')
     del model_dict["mask_token"]
+    del model_dict["norm.weight"], model_dict["norm.bias"]
     del model_dict["projector.weight"], model_dict["projector.bias"]
     return model_dict
 
@@ -446,6 +448,7 @@ def dofa_encoder_large(pretrained: bool = True, *args: Any, **kwargs: Any):
     url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_large_e100.pth"
     model_dict = torch.hub.load_state_dict_from_url(url, progress=True, map_location='cpu')
     del model_dict["mask_token"]
+    del model_dict["norm.weight"], model_dict["norm.bias"]
     del model_dict["projector.weight"], model_dict["projector.bias"]
     return model_dict
 
