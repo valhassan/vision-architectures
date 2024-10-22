@@ -539,9 +539,10 @@ class DOFASeg(nn.Module):
                                embedding_dim=self.embedding_dim, 
                                num_classes=num_classes)
     def forward(self, x):
+        image_size = x.shape[2:]
         x = self.encoder(x)
         x = self.decoder(x)
-        x = F.interpolate(input=x, size=img.shape[2:], scale_factor=None, mode='bilinear', align_corners=False)
+        x = F.interpolate(input=x, size=image_size, scale_factor=None, mode='bilinear', align_corners=False)
         return x
         
 
