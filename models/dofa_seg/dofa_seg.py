@@ -5,6 +5,7 @@
 
 from functools import partial
 from typing import Any
+import math
 import torch
 import yaml
 import warnings
@@ -128,7 +129,6 @@ class TransformerWeightGenerator(nn.Module):
         bias = self.fc_bias(transformer_output[-1])
         return weights, bias
 
-
 class FCResLayer(nn.Module):
     """Fully-connected residual layer."""
 
@@ -237,7 +237,7 @@ class DOFAEmbedding(nn.Module):
 
         x = dynamic_out
         x = x.flatten(2).transpose(1, 2)
-
+        
         return x, waves
 
 class Encoder(nn.Module):
@@ -250,7 +250,9 @@ class Encoder(nn.Module):
     * https://github.com/zhu-xlab/DOFA/blob/master/downstream_tasks/segmentation/models/dofa_vit.py
     
     """
-    def __init__(self, 
+    def __init__(self,
+                 encoder_name: str = 'dofa_base',
+                 pretrained: bool = True,
                  img_size: tuple = (224, 224),
                  patch_size: int = 16,
                  embed_dim: int = 768,
@@ -277,6 +279,8 @@ class Encoder(nn.Module):
         wavelengths = cfg["wavelengths"][sensor_name]
         model_wavelengths = [wavelengths[band] for band in bands]
         
+        self.encoder_name = encoder_name
+        self.pretrained = pretrained
         self.img_size = img_size
         self.patch_size = patch_size
         self.embed_dim = embed_dim
@@ -316,6 +320,27 @@ class Encoder(nn.Module):
                                            self.mlp_ratio, 
                                            self.qkv_bias, 
                                            norm_layer=norm_layer) for i in range(self.depth)])
+        self.init_weights()
+    
+    def init_weights(self):
+        if self.pretrained:
+            print(f"Loading pretrained weights for {self.encoder_name}")
+            if self.encoder_name == 'dofa_base':
+                model_dict = dofa_encoder_base()
+            elif self.encoder_name == 'dofa_large':
+                model_dict = dofa_encoder_large()
+            
+            if 'pos_embed' in model_dict.keys():
+                if self.pos_embed.shape != model_dict['pos_embed'].shape:
+                    print(f"Resize the pos_embed shape from {model_dict['pos_embed'].shape} to {self.pos_embed.shape}")
+                    h, w = self.img_size
+                    pos_size = int(math.sqrt(model_dict['pos_embed'].shape[1] - 1))
+                    model_dict['pos_embed'] = self.resize_pos_embed(model_dict['pos_embed'], 
+                                                                    (h // self.patch_size, w // self.patch_size), 
+                                                                    (pos_size, pos_size), self.interpolate_mode)
+            missing_keys, unexpected_keys = self.load_state_dict(model_dict, strict=False)
+            assert not missing_keys
+            assert not unexpected_keys
         
     def _pos_embeding(self, patched_img, hw_shape, pos_embed):
         """Positioning embeding method.
@@ -412,35 +437,17 @@ class Encoder(nn.Module):
 
 def dofa_encoder_base(pretrained: bool = True, *args: Any, **kwargs: Any):
     url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_base_e120.pth"
-    kwargs |= {'patch_size': 16, 'embed_dim': 768, 'depth': 12, 'num_heads': 12, 'out_layers': [2, 5, 8, 11]}
-    model = Encoder(*args, **kwargs)
-    
-    if pretrained:
-        model_dict = torch.hub.load_state_dict_from_url(url, progress=True)
-        del model_dict["mask_token"]
-        del model_dict["projector.weight"], model_dict["projector.bias"]
-        
-        missing_keys, unexpected_keys = model.load_state_dict(model_dict, strict=False)
-        assert not missing_keys
-        assert not unexpected_keys
-    
-    return model
+    model_dict = torch.hub.load_state_dict_from_url(url, progress=True, map_location='cpu')
+    del model_dict["mask_token"]
+    del model_dict["projector.weight"], model_dict["projector.bias"]
+    return model_dict
 
 def dofa_encoder_large(pretrained: bool = True, *args: Any, **kwargs: Any):
     url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_large_e100.pth"
-    kwargs |= {'patch_size': 16, 'embed_dim': 1024, 'depth': 24, 'num_heads': 16, 'out_layers': [3, 7, 11, 23]}
-    model = Encoder(*args, **kwargs)
-    
-    if pretrained:
-        model_dict = torch.hub.load_state_dict_from_url(url, progress=True, map_location='cpu')
-        del model_dict["mask_token"]
-        del model_dict["projector.weight"], model_dict["projector.bias"]
-        
-        missing_keys, unexpected_keys = model.load_state_dict(model_dict, strict=False)
-        assert not missing_keys
-        assert not unexpected_keys
-    
-    return model
+    model_dict = torch.hub.load_state_dict_from_url(url, progress=True, map_location='cpu')
+    del model_dict["mask_token"]
+    del model_dict["projector.weight"], model_dict["projector.bias"]
+    return model_dict
 
 class MLP(nn.Module):
     """
@@ -506,14 +513,23 @@ class Decoder(nn.Module):
 class DOFASeg(nn.Module):
     def __init__(self, 
                  encoder: str,
-                 num_classes: int = 1):
+                 pretrained: bool = True,
+                 image_size: tuple = (224, 224),
+                 num_classes: int = 1, 
+                 *args: Any, **kwargs: Any):
         super().__init__()
         if encoder == 'dofa_base':
-            self.encoder = dofa_encoder_base()
+            kwargs |= {'patch_size': 16, 'embed_dim': 768, 
+                       'depth': 12, 'num_heads': 12, 'out_layers': [2, 5, 8, 11]}
+            self.encoder = Encoder(encoder_name=encoder, 
+                                   pretrained=pretrained, img_size=image_size, *args, **kwargs)
             self.in_channels = [768, 768, 768, 768]
             self.embedding_dim = 768
         elif encoder == 'dofa_large':
-            self.encoder = dofa_encoder_large()
+            kwargs |= {'patch_size': 16, 'embed_dim': 1024, 
+                       'depth': 24, 'num_heads': 16, 'out_layers': [3, 7, 11, 23]}
+            self.encoder = Encoder(encoder_name=encoder, 
+                                   pretrained=pretrained, img_size=image_size, *args, **kwargs)
             self.in_channels = [1024, 1024, 1024, 1024]
             self.embedding_dim = 1024
         else:
@@ -531,15 +547,10 @@ class DOFASeg(nn.Module):
 
 if __name__ == '__main__':
     batch_size = 8
-    img = torch.rand(batch_size, 4, 224, 224)
-    model = DOFASeg(encoder='dofa_base', num_classes=5)
+    img = torch.rand(batch_size, 4, 512, 512)
+    model = DOFASeg(encoder='dofa_base',
+                    pretrained=True,
+                    image_size=(512, 512),
+                    num_classes=5)
     out = model(img)
-    print(f"Output shape: {out.shape}")
-    
-    # model = dofa_encoder_large()
-    # batch_size = 8
-    # img = torch.rand(batch_size, 4, 224, 224)
-    # out = model(img)
-    # print(f"Output length: {len(out)}")
-    # for i in out:
-    #     print(f"Output feature shape: {i.shape}")        
+    print(f"Output shape: {out.shape}")   
