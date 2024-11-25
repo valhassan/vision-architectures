@@ -12,6 +12,7 @@ import warnings
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.nn.init as init
+from neckhead import MultiLevelNeck
 from pathlib import Path
 from timm.models.vision_transformer import Block
 from torch import Tensor
@@ -492,21 +493,25 @@ class Decoder(nn.Module):
     def forward(self, x):
         c1, c2, c3, c4 = x
         n, _, h, w = c4.shape
-        reshape_size = (128, 128)
         
         _c4 = self.linear_c4(c4).permute(0, 2, 1).reshape(n, -1, c4.shape[2], c4.shape[3]).contiguous()
-        _c4 = F.interpolate(input=_c4, size=reshape_size, mode='bilinear', align_corners=False)
+        _c4 = F.interpolate(input=_c4, size=c1.size()[2:], mode='bilinear', align_corners=False)
+        # print(f"_c4 shape: {_c4.shape}")
         
         _c3 = self.linear_c3(c3).permute(0, 2, 1).reshape(n, -1, c3.shape[2], c3.shape[3]).contiguous()
-        _c3 = F.interpolate(input=_c3, size=reshape_size, mode='bilinear', align_corners=False)
+        _c3 = F.interpolate(input=_c3, size=c1.size()[2:], mode='bilinear', align_corners=False)
+        # print(f"_c3 shape: {_c3.shape}")
         
         _c2 = self.linear_c2(c2).permute(0, 2, 1).reshape(n, -1, c2.shape[2], c2.shape[3]).contiguous()
-        _c2 = F.interpolate(input=_c2, size=reshape_size, mode='bilinear', align_corners=False)
+        _c2 = F.interpolate(input=_c2, size=c1.size()[2:], mode='bilinear', align_corners=False)
+        # print(f"_c2 shape: {_c2.shape}")
         
         _c1 = self.linear_c1(c1).permute(0, 2, 1).reshape(n, -1, c1.shape[2], c1.shape[3]).contiguous()
-        _c1 = F.interpolate(input=_c1, size=reshape_size, mode='bilinear', align_corners=False)
+        _c1 = F.interpolate(input=_c1, size=c1.size()[2:], mode='bilinear', align_corners=False)
+        # print(f"_c1 shape: {_c1.shape}")
         
         _c = self.linear_fuse(torch.cat([_c4, _c3, _c2, _c1], dim=1))
+        # print(f"_c shape: {_c.shape}")
         x = self.dropout(_c)
         x = self.linear_pred(x)
         
@@ -538,12 +543,17 @@ class DOFASeg(nn.Module):
         else:
             raise ValueError(f"Unknown encoder: {encoder}")
         
+        self.neck = MultiLevelNeck(in_channels=self.in_channels, 
+                                   out_channels=self.embedding_dim, 
+                                   scales=[4, 2, 1, 0.5])
+        
         self.decoder = Decoder(in_channels=self.in_channels, 
                                embedding_dim=self.embedding_dim, 
                                num_classes=num_classes)
     def forward(self, x):
         image_size = x.shape[2:]
         x = self.encoder(x)
+        x = self.neck(x)    
         x = self.decoder(x)
         x = F.interpolate(input=x, size=image_size, scale_factor=None, mode='bilinear', align_corners=False)
         return x
