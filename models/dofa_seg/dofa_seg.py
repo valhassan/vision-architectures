@@ -438,7 +438,7 @@ class Encoder(nn.Module):
         return outs
 
 def dofa_encoder_base(pretrained: bool = True, *args: Any, **kwargs: Any):
-    url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_base_e120.pth"
+    url: str = "https://huggingface.co/XShadow/DOFA/resolve/main/DOFA_ViT_base_e100.pth"
     model_dict = torch.hub.load_state_dict_from_url(url, progress=True, map_location='cpu')
     del model_dict["mask_token"]
     del model_dict["norm.weight"], model_dict["norm.bias"]
@@ -542,18 +542,23 @@ class DOFASeg(nn.Module):
             self.embedding_dim = 1024
         else:
             raise ValueError(f"Unknown encoder: {encoder}")
-        
+        encoder_out_channels = [64, 128, 320, 512]
         self.neck = MultiLevelNeck(in_channels=self.in_channels, 
-                                   out_channels=self.embedding_dim, 
+                                   out_channels=encoder_out_channels, 
                                    scales=[4, 2, 1, 0.5])
         
-        self.decoder = Decoder(in_channels=self.in_channels, 
+        self.decoder = Decoder(in_channels=encoder_out_channels, 
                                embedding_dim=self.embedding_dim, 
                                num_classes=num_classes)
     def forward(self, x):
         image_size = x.shape[2:]
         x = self.encoder(x)
-        x = self.neck(x)    
+        x = self.neck(x)
+        c1, c2, c3, c4 = x
+        # print(f"c1 shape: {c1.shape}")
+        # print(f"c2 shape: {c2.shape}")
+        # print(f"c3 shape: {c3.shape}")
+        # print(f"c4 shape: {c4.shape}")    
         x = self.decoder(x)
         x = F.interpolate(input=x, size=image_size, scale_factor=None, mode='bilinear', align_corners=False)
         return x
